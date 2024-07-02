@@ -1,0 +1,150 @@
+#!/bin/bash
+
+# Конфигурация параметров базы данных и директорий для бэкапа
+DB_TYPE="postgresql"  # Тип базы данных: "postgresql" или "mysql"
+DB_NAME="your_database_name"  # Имя базы данных
+DB_USER="your_database_user"  # Пользователь базы данных
+DB_PASS="your_database_password"  # Пароль пользователя базы данных
+DB_HOST="localhost"  # Хост базы данных
+
+BACKUP_DIR="/path/to/backup"  # Директория для хранения бэкапов
+TMP_DIR="/path/to/temp_backup"  # Временная директория для бэкапов
+REMOTE_DIR="//192.0.0.253/Enterprise"  # Удаленная сетевая папка для бэкапов
+REMOTE_SERVER="192.0.0.253"  # IP-адрес удаленного сервера
+REMOTE_MOUNT_POINT="/mnt/remote_backup"  # Локальная точка монтирования для удаленного сервера
+REMOTE_USER="Enterprise"  # Пользователь для доступа к удаленной сетевой папке
+REMOTE_PASSWORD="E21"  # Пароль для доступа к удаленной сетевой папке
+LOG_FILE="/var/log/backup.log"  # Файл для логирования
+
+# Выбор места копирования бэкапов: "local" или "remote"
+COPY_DESTINATION="remote"  # Локально или на удаленный сервер
+
+# Массив директорий для бэкапа
+declare -a BACKUP_FOLDERS=("/path/to/first_folder" "/path/to/second_folder")
+
+# Проверка доступности директорий для бэкапа
+for DIR in "${BACKUP_FOLDERS[@]}"; do
+    if [ ! -d "$DIR" ]; then  # Если директория не существует
+        echo "Ошибка: Каталог $DIR не существует." >> "$LOG_FILE"  # Записать сообщение об ошибке в лог
+        exit 1  # Выйти из скрипта с кодом ошибки
+    fi
+done
+
+# Проверка и создание файла с датой последнего успешного бэкапа
+LAST_BACKUP_DATE_FILE="/path/to/last_backup_date"
+if [ ! -f "$LAST_BACKUP_DATE_FILE" ]; then
+    touch "$LAST_BACKUP_DATE_FILE"
+    date '+%Y-%m-%d %H:%M:%S' > "$LAST_BACKUP_DATE_FILE"
+fi
+
+# Функция для логирования сообщений
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"  # Записать сообщение с текущей датой и временем в лог
+}
+
+# Функция для проверки ошибок выполнения команд
+check_error() {
+    if [ $? -ne 0 ]; then  # Если предыдущая команда завершилась с ошибкой
+        log_message "Error: $1"  # Записать сообщение об ошибке в лог
+        exit 1  # Выйти из скрипта с кодом ошибки
+    fi
+}
+
+# Функция для бэкапа базы данных
+backup_database() {
+    log_message "Запуск резервного копирования базы данных..."
+    case $DB_TYPE in
+        postgresql)
+            PGPASSWORD=$DB_PASS pg_dump -h $DB_HOST -U $DB_USER $DB_NAME > "$TMP_DIR/db_backup.sql"  # Создание дампа базы данных PostgreSQL
+            check_error "Не удалось создать резервную копию базы данных PostgreSQL"
+            ;;
+        mysql)
+            mysqldump -h $DB_HOST -u $DB_USER -p$DB_PASS $DB_NAME > "$TMP_DIR/db_backup.sql"  # Создание дампа базы данных MySQL
+            check_error "Не удалось создать резервную копию базы данных MySQL"
+            ;;
+        *)
+            log_message "Неподдерживаемый тип базы данных: $DB_TYPE"
+            exit 1  # Выход из скрипта с кодом ошибки
+            ;;
+    esac
+    log_message "Резервное копирование базы данных завершено успешно."
+}
+
+# Функция для полного бэкапа файлов и базы данных
+full_backup() {
+    log_message "Запуск полного резервного копирования файлов..."
+    BACKUP_FILE="$TMP_DIR/full_backup_$(date '+%Y%m%d').tar.gz"  # Имя файла полного бэкапа
+    tar -cf - "${BACKUP_FOLDERS[@]}" "$TMP_DIR/db_backup.sql" | pigz > "$BACKUP_FILE"  # Создание архивного файла бэкапа с использованием компрессии
+    check_error "Не удалось создать полную резервную копию файла"
+    log_message "Полное резервное копирование файлов завершено успешно."
+}
+
+# Функция для инкрементного бэкапа файлов и базы данных
+incremental_backup() {
+    log_message "Запуск инкрементного резервного копирования файлов..."
+    BACKUP_FILE="$TMP_DIR/incremental_backup_$(date '+%Y%m%d').tar.gz"
+    LAST_BACKUP_DATE=$(cat "$LAST_BACKUP_DATE_FILE")
+    
+    # Создание инкрементного архива файлов, измененных после даты последнего успешного бэкапа
+    find "${BACKUP_FOLDERS[@]}" -type f -newermt "$LAST_BACKUP_DATE" -print0 | tar --null -cf - -T - "$TMP_DIR/db_backup.sql" | pigz > "$BACKUP_FILE"
+    check_error "Не удалось создать инкрементную копию файла"
+    
+    # Обновление даты последнего успешного бэкапа
+    date '+%Y-%m-%d %H:%M:%S' > "$LAST_BACKUP_DATE_FILE"
+    
+    log_message "Инкрементное резервное копирование файлов завершено успешно."
+}
+
+# Функция для копирования бэкапов
+copy_backups() {
+    log_message "Копирование резервных копий..."
+    if [ "$COPY_DESTINATION" == "local" ]; then  # Если место назначения локальное
+        cp "$TMP_DIR"/*.tar.gz "$BACKUP_DIR/"  # Копирование бэкапов в локальную директорию
+        check_error "Не удалось скопировать резервные копии в локальный каталог резервных копий"
+        log_message "Резервные копии успешно скопированы в локальный каталог."
+    elif [ "$COPY_DESTINATION" == "remote" ]; then  # Если место назначения удаленное
+        # Проверка доступности удаленного сервера
+        if ping -c 1 $REMOTE_SERVER &> /dev/null; then  # Проверка доступности удаленного сервера
+            mount | grep -q $REMOTE_MOUNT_POINT || mount -t cifs $REMOTE_DIR -o user=$REMOTE_USER,password=$REMOTE_PASSWORD $REMOTE_MOUNT_POINT  # Монтирование удаленного сервера, если он еще не смонтирован
+            check_error "Не удалось смонтировать удаленную папку"
+            cp "$TMP_DIR"/*.tar.gz "$REMOTE_MOUNT_POINT/"  # Копирование бэкапов в удаленную директорию
+            check_error "Не удалось скопировать резервные копии в удаленную папку"
+            
+            # Удаление локальных бэкапов после успешного копирования в удаленную папку
+            rm "$TMP_DIR"/*.tar.gz
+            check_error "Не удалось удалить локальные резервные копии после успешного копирования"
+            
+            log_message "Резервные копии успешно скопированы в удаленную папку и удалены с локального сервера."
+            umount $REMOTE_MOUNT_POINT  # Отмонтирование удаленного сервера
+        else
+            log_message "Удаленный сервер недоступен"
+            exit 1  # Выход из скрипта с кодом ошибки
+        fi
+    else
+        log_message "Неподдерживаемое место назначения для копирования резервных копий: $COPY_DESTINATION"
+        exit 1  # Выход из скрипта с кодом ошибки
+    fi
+}
+
+# Основная логика скрипта
+log_message "Запуск скрипта резервного копирования..."
+
+# Бэкап базы данных
+backup_database
+
+# Полный или инкрементный бэкап файлов в зависимости от дня недели
+DAY_OF_WEEK=$(date '+%u')  # Получение дня недели (1-7, где 1 - понедельник, 7 - воскресенье)
+if [ "$DAY_OF_WEEK" -eq 7 ]; then  # Если сегодня воскресенье
+    full_backup  # Выполнить полный бэкап
+else
+    incremental_backup  # Выполнить инкрементный бэкап
+fi
+
+# Копирование бэкапов
+copy_backups
+
+# Удаление временного файла дампа базы данных
+rm "$TMP_DIR/db_backup.sql"
+check_error "Не удалось удалить временный файл дампа базы данных"
+log_message "Скрипт резервного копирования успешно завершен."
+exit 0  # Выход из скрипта с кодом успеха
